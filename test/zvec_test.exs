@@ -476,6 +476,67 @@ defmodule ZvecTest do
     Zvec.Collection.destroy(col)
   end
 
+  test "vamana index type for graph-based ANN search" do
+    path = Path.join(System.tmp_dir!(), "zvec_vamana_#{System.unique_integer([:positive])}")
+
+    schema =
+      Zvec.Schema.new("vamana")
+      |> Zvec.Schema.add_vector("v", 4,
+        index: %{
+          type: :vamana,
+          metric_type: :l2,
+          max_degree: 32,
+          search_list_size: 50,
+          alpha: 1.2
+        }
+      )
+
+    {:ok, col} = Zvec.Collection.create_and_open(path, schema)
+
+    for i <- 1..10 do
+      vec = Zvec.Query.float_list_to_binary(List.duplicate(0.1 * i, 4))
+      :ok = Zvec.Collection.insert(col, [Zvec.Doc.new("vm#{i}", %{"v" => vec})])
+    end
+
+    :ok = Zvec.Collection.optimize(col)
+
+    query =
+      Zvec.Query.vector("v", [0.3, 0.3, 0.3, 0.3],
+        topk: 3,
+        query_params: %{type: :vamana, ef_search: 64}
+      )
+
+    {:ok, results} = Zvec.Collection.query(col, query)
+    assert length(results) == 3
+
+    Zvec.Collection.destroy(col)
+  end
+
+  test "hnsw with use_contiguous_memory option" do
+    path = Path.join(System.tmp_dir!(), "zvec_hnsw_contig_#{System.unique_integer([:positive])}")
+
+    schema =
+      Zvec.Schema.new("hnsw_contig")
+      |> Zvec.Schema.add_vector("v", 4,
+        index: %{type: :hnsw, metric_type: :l2, use_contiguous_memory: true}
+      )
+
+    {:ok, col} = Zvec.Collection.create_and_open(path, schema)
+
+    for i <- 1..5 do
+      vec = Zvec.Query.float_list_to_binary(List.duplicate(0.1 * i, 4))
+      :ok = Zvec.Collection.insert(col, [Zvec.Doc.new("hc#{i}", %{"v" => vec})])
+    end
+
+    :ok = Zvec.Collection.optimize(col)
+
+    query = Zvec.Query.vector("v", [0.3, 0.3, 0.3, 0.3], topk: 2)
+    {:ok, results} = Zvec.Collection.query(col, query)
+    assert length(results) == 2
+
+    Zvec.Collection.destroy(col)
+  end
+
   test "delete multiple pks at once", %{col: col} do
     vec = Zvec.Query.float_list_to_binary([1.0, 1.0, 1.0, 1.0])
 

@@ -263,11 +263,15 @@ static zvec::IndexParams::Ptr decode_index_params(ErlNifEnv *env,
   if (type_str == "hnsw") {
     int m = 16;
     int ef = 200;
+    bool use_contig = false;
     auto m_term = map_get(env, term, "m");
     if (m_term) m = static_cast<int>(term_to_int(env, m_term));
     auto ef_term = map_get(env, term, "ef_construction");
     if (ef_term) ef = static_cast<int>(term_to_int(env, ef_term));
-    return std::make_shared<zvec::HnswIndexParams>(metric, m, ef, quantize);
+    auto uc_term = map_get(env, term, "use_contiguous_memory");
+    if (uc_term) use_contig = term_to_bool(env, uc_term);
+    return std::make_shared<zvec::HnswIndexParams>(metric, m, ef, quantize,
+                                                   use_contig);
   }
 
   if (type_str == "flat") {
@@ -302,6 +306,31 @@ static zvec::IndexParams::Ptr decode_index_params(ErlNifEnv *env,
     if (ef_term) ef_construction = static_cast<int>(term_to_int(env, ef_term));
     return std::make_shared<zvec::HnswRabitqIndexParams>(
         metric, total_bits, num_clusters, m, ef_construction);
+  }
+
+  if (type_str == "vamana") {
+    int max_degree = 64;
+    int search_list_size = 100;
+    float alpha = 1.2f;
+    bool saturate_graph = false;
+    bool use_contig = false;
+    bool use_id_map = false;
+    auto md_term = map_get(env, term, "max_degree");
+    if (md_term) max_degree = static_cast<int>(term_to_int(env, md_term));
+    auto sls_term = map_get(env, term, "search_list_size");
+    if (sls_term)
+      search_list_size = static_cast<int>(term_to_int(env, sls_term));
+    auto a_term = map_get(env, term, "alpha");
+    if (a_term) alpha = static_cast<float>(term_to_double(env, a_term));
+    auto sg_term = map_get(env, term, "saturate_graph");
+    if (sg_term) saturate_graph = term_to_bool(env, sg_term);
+    auto uc_term = map_get(env, term, "use_contiguous_memory");
+    if (uc_term) use_contig = term_to_bool(env, uc_term);
+    auto um_term = map_get(env, term, "use_id_map");
+    if (um_term) use_id_map = term_to_bool(env, um_term);
+    return std::make_shared<zvec::VamanaIndexParams>(
+        metric, max_degree, search_list_size, alpha, saturate_graph, use_contig,
+        use_id_map, quantize);
   }
 
   throw std::invalid_argument("unknown index type: " + type_str);
@@ -566,23 +595,49 @@ static zvec::VectorQuery decode_vector_query(ErlNifEnv *env,
     auto type_term = map_get(env, qp_term, "type");
     if (type_term) {
       auto type_str = term_to_atom_string(env, type_term);
+
+      // Shared optional knobs on QueryParams base
+      float radius = 0.0f;
+      bool is_linear = false;
+      bool is_using_refiner = false;
+      float scale_factor = 10.0f;
+      auto r_term = map_get(env, qp_term, "radius");
+      if (r_term) radius = static_cast<float>(term_to_double(env, r_term));
+      auto il_term = map_get(env, qp_term, "is_linear");
+      if (il_term) is_linear = term_to_bool(env, il_term);
+      auto iur_term = map_get(env, qp_term, "is_using_refiner");
+      if (iur_term) is_using_refiner = term_to_bool(env, iur_term);
+      auto sf_term = map_get(env, qp_term, "scale_factor");
+      if (sf_term)
+        scale_factor = static_cast<float>(term_to_double(env, sf_term));
+
       if (type_str == "hnsw") {
         int ef = 200;
         auto ef_term = map_get(env, qp_term, "ef");
         if (ef_term) ef = static_cast<int>(term_to_int(env, ef_term));
-        q.query_params_ = std::make_shared<zvec::HnswQueryParams>(ef);
+        q.query_params_ = std::make_shared<zvec::HnswQueryParams>(
+            ef, radius, is_linear, is_using_refiner);
       } else if (type_str == "ivf") {
         int nprobe = 10;
         auto np_term = map_get(env, qp_term, "nprobe");
         if (np_term) nprobe = static_cast<int>(term_to_int(env, np_term));
-        q.query_params_ = std::make_shared<zvec::IVFQueryParams>(nprobe);
+        q.query_params_ = std::make_shared<zvec::IVFQueryParams>(
+            nprobe, is_using_refiner, scale_factor);
       } else if (type_str == "flat") {
-        q.query_params_ = std::make_shared<zvec::FlatQueryParams>();
+        q.query_params_ = std::make_shared<zvec::FlatQueryParams>(
+            is_using_refiner, scale_factor);
       } else if (type_str == "hnsw_rabitq") {
         int ef = 200;
         auto ef_term = map_get(env, qp_term, "ef");
         if (ef_term) ef = static_cast<int>(term_to_int(env, ef_term));
-        q.query_params_ = std::make_shared<zvec::HnswRabitqQueryParams>(ef);
+        q.query_params_ = std::make_shared<zvec::HnswRabitqQueryParams>(
+            ef, radius, is_linear, is_using_refiner);
+      } else if (type_str == "vamana") {
+        int ef_search = 200;
+        auto efs_term = map_get(env, qp_term, "ef_search");
+        if (efs_term) ef_search = static_cast<int>(term_to_int(env, efs_term));
+        q.query_params_ = std::make_shared<zvec::VamanaQueryParams>(
+            ef_search, radius, is_linear, is_using_refiner);
       }
     }
   }

@@ -53,12 +53,17 @@ defmodule Zvec.Schema do
     * `:type` - vector element type (default: `:vector_fp32`)
     * `:nullable` - whether the field can be null (default: `false`)
     * `:index` - index params map, e.g. `%{type: :hnsw, metric_type: :cosine}`
-      Supported types: `:hnsw`, `:flat`, `:ivf`, `:invert`, `:hnsw_rabitq`
+      Supported types: `:hnsw`, `:flat`, `:ivf`, `:invert`, `:hnsw_rabitq`, `:vamana`
+      `:hnsw` options: `:m` (default 16), `:ef_construction` (default 200),
+      `:use_contiguous_memory` (default false)
       `:hnsw_rabitq` options: `:total_bits` (default 7), `:num_clusters` (default 16),
       `:m`, `:ef_construction`
+      `:vamana` options: `:max_degree` (default 64), `:search_list_size` (default 100),
+      `:alpha` (default 1.2), `:saturate_graph` (default false),
+      `:use_contiguous_memory` (default false), `:use_id_map` (default false)
       Quantization is specified in the `:index` params map with
       `quantize_type: :fp16 | :int8 | :int4 | :rabitq`
-      Supported for vector index types `:hnsw`, `:flat`, and `:ivf`
+      Supported for vector index types `:hnsw`, `:flat`, `:ivf`, and `:vamana`
   """
   @spec add_vector(t(), String.t(), pos_integer(), keyword()) :: t()
   def add_vector(%__MODULE__{} = schema, name, dimension, opts \\ []) do

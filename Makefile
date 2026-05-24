@@ -43,7 +43,7 @@ ZVEC_FORCE_LIBS = \
 	$(ZVEC_LIB)/libzvec_ailego.a
 
 # Third-party static libs
-# NOTE: In zvec 0.3.0, antlr4 is output to dist/ instead of external/usr/local/lib/
+# NOTE: In zvec 0.4.0, antlr4 is output to dist/ instead of external/usr/local/lib/
 THIRDPARTY_LIBS = \
 	$(ZVEC_EXT_LIB)/librocksdb.a \
 	$(ZVEC_EXT_LIB)/libarrow.a \
@@ -59,17 +59,27 @@ THIRDPARTY_LIBS = \
 	$(ZVEC_EXT_LIB)/libroaring.a \
 	$(ZVEC_EXT_LIB)/liblz4.a
 
-# Platform-specific linking
+# Don't let the user's shell LDFLAGS / CXXFLAGS / CFLAGS leak into the
+# CMake sub-build (cmake reads them at configure time and bakes them into
+# every link command — e.g. a shell `LDFLAGS=-L...` plus our reassignment
+# below would produce `-shared` link lines for protoc and friends).
+unexport LDFLAGS
+unexport CXXFLAGS
+unexport CFLAGS
+unexport CPPFLAGS
+
+# Platform-specific linking for the FINAL NIF .so link only (intentionally
+# not named LDFLAGS so it can never be exported to the cmake sub-build).
 UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S),Darwin)
   # macOS: -force_load for static constructor registration, -undefined dynamic_lookup for BEAM symbols
-  LDFLAGS = -shared -flat_namespace -undefined dynamic_lookup
+  NIF_LDFLAGS = -shared -flat_namespace -undefined dynamic_lookup
   FORCE_LOAD_FLAGS = $(foreach lib,$(ZVEC_FORCE_LIBS),-Wl,-force_load,$(lib))
   SYS_LIBS = -lc++ -lz -lbz2
 else
   # Linux: --whole-archive for static constructors
-  LDFLAGS = -shared
+  NIF_LDFLAGS = -shared
   FORCE_LOAD_FLAGS = -Wl,--whole-archive $(ZVEC_FORCE_LIBS) -Wl,--no-whole-archive
   SYS_LIBS = -lstdc++ -lz -lbz2 -lpthread -ldl -lrt
 endif
@@ -90,7 +100,7 @@ all: $(NIF_SO)
 
 # Stage 1: Clone zvec if needed
 $(ZVEC_SRC)/CMakeLists.txt:
-	git clone --branch v0.3.0 --recurse-submodules --depth 1 \
+	git clone --branch v0.4.0 --recurse-submodules --depth 1 \
 		https://github.com/alibaba/zvec.git $(ZVEC_SRC)
 
 # Stage 1b: Patch antlr4 CMakeLists for modern CMake compatibility
@@ -121,7 +131,7 @@ $(ZVEC_BUILD)/.built: $(ZVEC_BUILD)/Makefile
 # Stage 2: Compile and link NIF
 $(NIF_SO): c_src/zvec_nif.cpp $(ZVEC_BUILD)/.built
 	@mkdir -p $(PRIV_DIR)
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) \
+	$(CXX) $(CXXFLAGS) $(NIF_LDFLAGS) \
 		c_src/zvec_nif.cpp \
 		$(FORCE_LOAD_FLAGS) \
 		$(THIRDPARTY_LIBS) \
