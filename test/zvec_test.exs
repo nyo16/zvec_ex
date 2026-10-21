@@ -553,4 +553,215 @@ defmodule ZvecTest do
     assert length(docs) == 1
     assert hd(docs).pk == "dm4"
   end
+
+  test "insert of a duplicate pk returns the per-document error", %{col: col} do
+    vec = Zvec.Query.float_list_to_binary([1.0, 0.0, 0.0, 0.0])
+    doc = Zvec.Doc.new("dup", %{"vec" => vec, "text" => "a", "score_val" => 1})
+
+    assert :ok = Zvec.Collection.insert(col, [doc])
+    assert {:error, {:already_exists, _}} = Zvec.Collection.insert(col, [doc])
+    assert :ok = Zvec.Collection.upsert(col, [doc])
+  end
+
+  test "fetch preserves request order and honors projection options", %{col: col} do
+    for i <- 1..3 do
+      vec = Zvec.Query.float_list_to_binary([i * 1.0, 0.0, 0.0, 1.0])
+      doc = Zvec.Doc.new("f#{i}", %{"vec" => vec, "text" => "t#{i}", "score_val" => i})
+      :ok = Zvec.Collection.insert(col, [doc])
+    end
+
+    {:ok, docs} =
+      Zvec.Collection.fetch(col, ["f3", "missing", "f1"],
+        output_fields: ["text"],
+        include_vector: false
+      )
+
+    assert Enum.map(docs, & &1.pk) == ["f3", "f1"]
+    assert Enum.map(docs, & &1.fields) == [%{"text" => "t3"}, %{"text" => "t1"}]
+  end
+
+  test "stream iterates a snapshot and blocks DDL until closed", %{col: col} do
+    for i <- 1..5 do
+      vec = Zvec.Query.float_list_to_binary([i * 1.0, 1.0, 0.0, 0.0])
+      doc = Zvec.Doc.new("it#{i}", %{"vec" => vec, "text" => "x", "score_val" => i})
+      :ok = Zvec.Collection.insert(col, [doc])
+    end
+
+    {:ok, stream} = Zvec.Collection.stream(col, batch_size: 2, include_vector: false)
+
+    assert {:error, {:failed_precondition, _}} =
+             Zvec.Collection.create_index(col, "text", %{type: :invert})
+
+    # Docs written after the snapshot are not visible to the iterator.
+    vec = Zvec.Query.float_list_to_binary([9.0, 1.0, 0.0, 0.0])
+
+    :ok =
+      Zvec.Collection.insert(col, [
+        Zvec.Doc.new("late", %{"vec" => vec, "text" => "x", "score_val" => 9})
+      ])
+
+    pks = stream |> Enum.map(& &1.pk) |> Enum.sort()
+    assert pks == ["it1", "it2", "it3", "it4", "it5"]
+
+    # The iterator is closed once the stream is consumed or halted.
+    {:ok, stream} = Zvec.Collection.stream(col)
+    assert [_] = Enum.take(stream, 1)
+    assert :ok = Zvec.Collection.create_index(col, "text", %{type: :invert})
+  end
+
+  test "close rejects further operations" do
+    path = Path.join(System.tmp_dir!(), "zvec_close_#{System.unique_integer([:positive])}")
+    schema = Zvec.Schema.new("close") |> Zvec.Schema.add_vector("v", 4)
+    {:ok, col} = Zvec.Collection.create_and_open(path, schema)
+
+    assert :ok = Zvec.Collection.close(col)
+    assert {:error, _} = Zvec.Collection.query(col, Zvec.Query.vector("v", [1.0, 0.0, 0.0, 0.0]))
+
+    {:ok, reopened} = Zvec.Collection.open(path)
+    Zvec.Collection.destroy(reopened)
+  end
+
+  test "unknown query_params type raises" do
+    query = Zvec.Query.vector("vec", [1.0, 0.0, 0.0, 0.0], query_params: %{type: :bogus})
+    path = Path.join(System.tmp_dir!(), "zvec_qp_#{System.unique_integer([:positive])}")
+    schema = Zvec.Schema.new("qp") |> Zvec.Schema.add_vector("vec", 4)
+    {:ok, col} = Zvec.Collection.create_and_open(path, schema)
+
+    assert_raise ArgumentError, ~r/unknown query_params type/, fn ->
+      Zvec.Collection.query(col, query)
+    end
+
+    Zvec.Collection.destroy(col)
+  end
+
+  test "vector_fp16 fields round-trip and are searchable" do
+    path = Path.join(System.tmp_dir!(), "zvec_fp16_#{System.unique_integer([:positive])}")
+
+    schema =
+      Zvec.Schema.new("fp16")
+      |> Zvec.Schema.add_vector("h", 4,
+        type: :vector_fp16,
+        index: %{type: :flat, metric_type: :l2}
+      )
+
+    {:ok, col} = Zvec.Collection.create_and_open(path, schema)
+    fp16 = fn list -> for f <- list, into: <<>>, do: <<f::float-16-native>> end
+
+    :ok = Zvec.Collection.insert(col, [Zvec.Doc.new("a", %{"h" => fp16.([1.0, 0.0, 0.0, 0.0])})])
+    :ok = Zvec.Collection.insert(col, [Zvec.Doc.new("b", %{"h" => fp16.([0.0, 1.0, 0.0, 0.0])})])
+
+    {:ok, [top | _]} =
+      Zvec.Collection.query(
+        col,
+        Zvec.Query.vector("h", fp16.([0.0, 0.9, 0.0, 0.0]), include_vector: true)
+      )
+
+    assert top.pk == "b"
+    assert top.fields["h"] == fp16.([0.0, 1.0, 0.0, 0.0])
+    assert {:ok, %{fields: [%{type: :vector_fp16}]}} = Zvec.Collection.schema(col)
+
+    Zvec.Collection.destroy(col)
+  end
+
+  test "diskann index type" do
+    path = Path.join(System.tmp_dir!(), "zvec_diskann_#{System.unique_integer([:positive])}")
+
+    schema =
+      Zvec.Schema.new("diskann")
+      |> Zvec.Schema.add_vector("v", 4,
+        index: %{type: :diskann, metric_type: :l2, max_degree: 32, list_size: 50, pq_chunk_num: 2}
+      )
+
+    {:ok, col} = Zvec.Collection.create_and_open(path, schema)
+
+    docs =
+      for i <- 1..50 do
+        Zvec.Doc.new("p#{i}", %{"v" => Zvec.Query.float_list_to_binary([i * 1.0, 1.0, 0.0, 0.0])})
+      end
+
+    :ok = Zvec.Collection.insert(col, docs)
+    :ok = Zvec.Collection.optimize(col)
+
+    query =
+      Zvec.Query.vector("v", [7.0, 1.0, 0.0, 0.0],
+        topk: 3,
+        query_params: %{type: :diskann, list_size: 100}
+      )
+
+    {:ok, results} = Zvec.Collection.query(col, query)
+    assert hd(results).pk == "p7"
+
+    Zvec.Collection.destroy(col)
+  end
+
+  describe "full-text search" do
+    setup do
+      path = Path.join(System.tmp_dir!(), "zvec_fts_#{System.unique_integer([:positive])}")
+
+      schema =
+        Zvec.Schema.new("fts")
+        |> Zvec.Schema.add_field("content", :string, index: %{type: :fts})
+        |> Zvec.Schema.add_field("cat", :string, index: %{type: :invert})
+        |> Zvec.Schema.add_vector("v", 4, index: %{type: :hnsw, metric_type: :l2})
+
+      {:ok, col} = Zvec.Collection.create_and_open(path, schema)
+
+      texts = [
+        {"d1", "vector database for semantic search", "a", [1.0, 0.0, 0.0, 0.0]},
+        {"d2", "full text search with bm25 ranking", "b", [0.0, 1.0, 0.0, 0.0]},
+        {"d3", "cooking pasta at home", "a", [0.0, 0.0, 1.0, 0.0]},
+        {"d4", "hybrid retrieval combines vector and text search", "b", [0.0, 0.0, 0.0, 1.0]}
+      ]
+
+      docs =
+        for {pk, content, cat, v} <- texts do
+          Zvec.Doc.new(pk, %{
+            "content" => content,
+            "cat" => cat,
+            "v" => Zvec.Query.float_list_to_binary(v)
+          })
+        end
+
+      :ok = Zvec.Collection.insert(col, docs)
+      on_exit(fn -> Zvec.Collection.destroy(col) end)
+      %{col: col}
+    end
+
+    defp pks(col, query) do
+      {:ok, results} = Zvec.Collection.query(col, query)
+      results |> Enum.map(& &1.pk) |> Enum.sort()
+    end
+
+    test "match syntax combines terms with the default operator", %{col: col} do
+      assert pks(col, Zvec.Query.fts("content", "search")) == ["d1", "d2", "d4"]
+      assert pks(col, Zvec.Query.fts("content", "pasta vector")) == ["d1", "d3", "d4"]
+
+      assert pks(col, Zvec.Query.fts("content", "vector search", default_operator: :and)) ==
+               ["d1", "d4"]
+    end
+
+    test "query syntax supports required and excluded terms", %{col: col} do
+      assert pks(col, Zvec.Query.fts("content", "+search -vector", syntax: :query)) == ["d2"]
+    end
+
+    test "fts honors scalar filters", %{col: col} do
+      assert pks(col, Zvec.Query.fts("content", "search", filter: "cat = 'b'")) == ["d2", "d4"]
+    end
+
+    test "multi query fuses vector and text results", %{col: col} do
+      subqueries = [
+        Zvec.Query.vector("v", [0.0, 0.0, 1.0, 0.0], topk: 4),
+        Zvec.Query.fts("content", "pasta", topk: 4)
+      ]
+
+      for rerank <- [:rrf, {:rrf, 10}, {:weighted, [0.5, 0.5]}] do
+        {:ok, [top | _] = results} =
+          Zvec.Collection.query(col, Zvec.Query.multi(subqueries, topk: 2, rerank: rerank))
+
+        assert length(results) == 2
+        # d3 is ranked first by both sub-queries.
+        assert top.pk == "d3"
+      end
+    end
+  end
 end

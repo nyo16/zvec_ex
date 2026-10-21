@@ -13,6 +13,9 @@ defmodule Zvec.Native do
   def collection_open(_path, _options),
     do: :erlang.nif_error(:not_loaded)
 
+  def collection_close(_ref),
+    do: :erlang.nif_error(:not_loaded)
+
   def collection_destroy(_ref),
     do: :erlang.nif_error(:not_loaded)
 
@@ -40,7 +43,10 @@ defmodule Zvec.Native do
   def collection_query(_ref, _query),
     do: :erlang.nif_error(:not_loaded)
 
-  def collection_fetch(_ref, _pks),
+  def collection_multi_query(_ref, _query),
+    do: :erlang.nif_error(:not_loaded)
+
+  def collection_fetch(_ref, _pks, _options),
     do: :erlang.nif_error(:not_loaded)
 
   def collection_create_index(_ref, _column, _params),
@@ -50,5 +56,14 @@ defmodule Zvec.Native do
     do: :erlang.nif_error(:not_loaded)
 
   def collection_optimize(_ref),
+    do: :erlang.nif_error(:not_loaded)
+
+  def iterator_create(_ref, _options),
+    do: :erlang.nif_error(:not_loaded)
+
+  def iterator_next(_iterator, _max),
+    do: :erlang.nif_error(:not_loaded)
+
+  def iterator_close(_iterator),
     do: :erlang.nif_error(:not_loaded)
 end

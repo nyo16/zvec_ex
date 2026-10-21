@@ -10,7 +10,11 @@ PRIV_DIR = $(MIX_APP_PATH)/priv
 NIF_SO   = $(PRIV_DIR)/libzvec_nif.so
 
 # zvec paths
+ZVEC_VERSION = v0.8.0
 ZVEC_SRC     = c_src/zvec_vendor
+# Stamp recording which zvec release is checked out; bumping ZVEC_VERSION
+# forces a fresh clone instead of silently reusing a stale vendor tree.
+ZVEC_STAMP   = $(ZVEC_SRC)/.zvec-$(ZVEC_VERSION)
 ZVEC_BUILD   = $(ZVEC_SRC)/build
 ZVEC_LIB     = $(ZVEC_BUILD)/lib
 ZVEC_EXT_LIB = $(ZVEC_BUILD)/external/usr/local/lib
@@ -33,27 +37,28 @@ CXXFLAGS += -I$(ZVEC_SRC)/thirdparty/sparsehash/sparsehash-2.0.4/src
 CXXFLAGS += -I$(ZVEC_SRC)/thirdparty/magic_enum/magic_enum-0.9.7/include
 
 # First-party static libs (force-load to preserve static constructors for algorithm registration)
-# NOTE: zvec_db.a and zvec_core.a are built with GLOB_RECURSE and already contain
-# all sub-library objects (zvec_common, zvec_index, zvec_sqlengine, core_knn_*, etc.)
-# so we only force-load the top-level aggregates to avoid duplicate symbols.
+# NOTE: libzvec.a (the db layer) and libzvec_core.a are built with GLOB_RECURSE and
+# already contain all sub-library objects (zvec_common, zvec_index, zvec_sqlengine,
+# core_knn_*, etc.), so we only force-load the top-level aggregates to avoid
+# duplicate symbols.
 ZVEC_FORCE_LIBS = \
-	$(ZVEC_LIB)/libzvec_db.a \
+	$(ZVEC_LIB)/libzvec.a \
 	$(ZVEC_LIB)/libzvec_core.a \
 	$(ZVEC_LIB)/libzvec_turbo.a \
 	$(ZVEC_LIB)/libzvec_ailego.a
 
-# Third-party static libs
-# NOTE: In zvec 0.4.0, antlr4 is output to dist/ instead of external/usr/local/lib/
+# Third-party static libs (FTS: FastPFOR, snowball, utf8proc; storage: rocksdb, arrow)
 THIRDPARTY_LIBS = \
+	$(ZVEC_LIB)/libFastPFOR.a \
+	$(ZVEC_LIB)/libsnowball.a \
+	$(ZVEC_LIB)/libutf8proc.a \
 	$(ZVEC_EXT_LIB)/librocksdb.a \
-	$(ZVEC_EXT_LIB)/libarrow.a \
-	$(ZVEC_EXT_LIB)/libarrow_compute.a \
-	$(ZVEC_EXT_LIB)/libarrow_acero.a \
-	$(ZVEC_EXT_LIB)/libarrow_dataset.a \
 	$(ZVEC_EXT_LIB)/libparquet.a \
+	$(ZVEC_EXT_LIB)/libarrow_acero.a \
+	$(ZVEC_EXT_LIB)/libarrow_compute.a \
+	$(ZVEC_EXT_LIB)/libarrow.a \
 	$(ZVEC_EXT_LIB)/libarrow_bundled_dependencies.a \
-	$(ZVEC_SRC)/dist/libantlr4-runtime.a \
-	$(ZVEC_EXT_LIB)/libprotobuf.a \
+	$(ZVEC_EXT_LIB)/libantlr4-runtime.a \
 	$(ZVEC_EXT_LIB)/libglog.a \
 	$(ZVEC_EXT_LIB)/libgflags_nothreads.a \
 	$(ZVEC_EXT_LIB)/libroaring.a \
@@ -90,42 +95,34 @@ CMAKE_FLAGS = \
 	-DBUILD_PYTHON_BINDINGS=OFF \
 	-DBUILD_C_BINDINGS=OFF \
 	-DBUILD_TOOLS=OFF \
+	-DBUILD_ZVEC_SHARED=OFF \
+	-DBUILD_ZVEC_AILEGO_SHARED=OFF \
+	-DBUILD_ZVEC_CORE_SHARED=OFF \
 	-DCMAKE_BUILD_TYPE=Release \
-	-DRABITQ_ENABLE_AVX512=OFF \
 	-DCMAKE_POLICY_VERSION_MINIMUM=3.5
 
 .PHONY: all clean
 
 all: $(NIF_SO)
 
-# Stage 1: Clone zvec if needed
-$(ZVEC_SRC)/CMakeLists.txt:
-	git clone --branch v0.4.0 --recurse-submodules --depth 1 \
+# Stage 1: Clone the pinned zvec release (re-clones when ZVEC_VERSION changes)
+$(ZVEC_STAMP):
+	rm -rf $(ZVEC_SRC)
+	git clone --branch $(ZVEC_VERSION) --recurse-submodules --depth 1 \
 		https://github.com/alibaba/zvec.git $(ZVEC_SRC)
-
-# Stage 1b: Patch antlr4 CMakeLists for modern CMake compatibility
-$(ZVEC_SRC)/.patched: $(ZVEC_SRC)/CMakeLists.txt
-	@touch $(ZVEC_SRC)/thirdparty/antlr/antlr4/.antlr4_fix_patched
-	@if grep -q "CMP0054 OLD" $(ZVEC_SRC)/thirdparty/antlr/antlr4/runtime/Cpp/CMakeLists.txt 2>/dev/null; then \
-		sed -i.bak \
-			-e '/CMP0045 OLD/d' \
-			-e 's/CMP0054 OLD/CMP0054 NEW/' \
-			-e '/CMP0059 OLD/d' \
-			-e '/CMP0042 OLD/d' \
-			-e 's/CMP0042 OLD/CMP0042 NEW/' \
-			$(ZVEC_SRC)/thirdparty/antlr/antlr4/runtime/Cpp/CMakeLists.txt; \
-	fi
 	touch $@
 
-# Stage 1c: CMake configure
-$(ZVEC_BUILD)/Makefile: $(ZVEC_SRC)/.patched
+# Stage 1b: CMake configure (upstream applies its own antlr4 CMake-policy patch)
+$(ZVEC_BUILD)/Makefile: $(ZVEC_STAMP)
 	mkdir -p $(ZVEC_BUILD) && \
 	cd $(ZVEC_BUILD) && \
 	cmake .. $(CMAKE_FLAGS)
 
-# Stage 1d: CMake build (only runs once, stamp file tracks completion)
+# Stage 1c: CMake build (only runs once, stamp file tracks completion).
+# Only the static libraries the NIF links are built; zvec's own test suite is skipped.
 $(ZVEC_BUILD)/.built: $(ZVEC_BUILD)/Makefile
-	cmake --build $(ZVEC_BUILD) -j$$(sysctl -n hw.ncpu 2>/dev/null || nproc)
+	cmake --build $(ZVEC_BUILD) --target zvec zvec_core zvec_turbo zvec_ailego \
+		-j$$(sysctl -n hw.ncpu 2>/dev/null || nproc)
 	touch $@
 
 # Stage 2: Compile and link NIF

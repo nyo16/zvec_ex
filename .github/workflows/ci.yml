@@ -12,6 +12,8 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   MIX_ENV: test
+  # Always build the NIF from the checked-out C++ source, never a precompiled release.
+  ZVEC_BUILD: "true"
   ELIXIR_VERSION: "1.18"
   OTP_VERSION: "27"
 
