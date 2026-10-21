@@ -106,3 +106,40 @@ jobs:
       - run: mix deps.compile
       - run: mix compile
       - run: mix test
+
+  test-linux:
+    name: Tests (ubuntu-24.04 / OTP 27 / Elixir 1.18, incl. RaBitQ)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+
+      # zvec needs CMake >= 3.26; Ubuntu 24.04 ships 3.28.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libbz2-dev zlib1g-dev
+
+      - name: Cache deps & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build
+          key: linux-mix-1.18-27-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            linux-mix-1.18-27-
+
+      # A cold zvec build (arrow + rocksdb) takes 10-15 min; the Makefile pins
+      # ZVEC_VERSION, so its hash identifies the vendored build.
+      - name: Cache zvec vendor build
+        uses: actions/cache@v5
+        with:
+          path: c_src/zvec_vendor
+          key: linux-zvec-vendor-${{ hashFiles('Makefile') }}
+
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: mix test --include rabitq

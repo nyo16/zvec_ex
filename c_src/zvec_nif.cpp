@@ -13,6 +13,7 @@
 #include <zvec/db/status.h>
 #include <zvec/db/type.h>
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -462,7 +463,23 @@ static zvec::IndexParams::Ptr decode_index_params(ErlNifEnv *env,
 static zvec::FieldSchema::Ptr decode_field_schema(ErlNifEnv *env,
                                                   ERL_NIF_TERM term) {
   auto name = term_to_string(env, map_get(env, term, "name"));
-  auto data_type = decode_data_type(env, map_get(env, term, "type"));
+  auto type_term = map_get(env, term, "type");
+  auto data_type = decode_data_type(env, type_term);
+
+  // decode_doc cannot write these types, so a collection with such a field
+  // could never be populated. They stay in kDataTypeNames so encode_data_type
+  // still names fields of collections created by other bindings.
+  switch (data_type) {
+    case zvec::DataType::SPARSE_VECTOR_FP16:
+    case zvec::DataType::SPARSE_VECTOR_FP32:
+    case zvec::DataType::VECTOR_BINARY32:
+    case zvec::DataType::VECTOR_BINARY64:
+    case zvec::DataType::VECTOR_UINT8:
+      throw std::invalid_argument("unsupported field type for field " + name +
+                                  ": " + term_to_atom_string(env, type_term));
+    default:
+      break;
+  }
 
   bool nullable = false;
   if (auto t = map_get_present(env, term, "nullable")) {
@@ -669,8 +686,9 @@ static std::vector<zvec::Doc> decode_docs(ErlNifEnv *env, ERL_NIF_TERM term,
   return docs;
 }
 
-// Decode query params: %{type: :hnsw, ef: 300, ...}. Unset knobs keep the
-// zvec defaults for the given index type.
+// Decode query params: %{type: :hnsw, ef: 300, ...}. Unset `ef`/`ef_search`
+// default to 200 (this binding's historical default; zvec's own HNSW default
+// is 300). Every other unset knob keeps zvec's default for the index type.
 static zvec::QueryParams::Ptr decode_query_params(ErlNifEnv *env,
                                                   ERL_NIF_TERM term) {
   if (!enif_is_map(env, term)) {
@@ -820,6 +838,9 @@ static zvec::reranker::RerankParams decode_rerank(ErlNifEnv *env,
   if (type_str == "weighted") {
     auto w_term = map_get_present(env, term, "weights");
     if (!w_term) throw std::invalid_argument("weighted rerank needs :weights");
+    if (!enif_is_list(env, w_term)) {
+      throw std::invalid_argument("weighted rerank :weights must be a list");
+    }
     zvec::reranker::WeightedParams weighted;
     ERL_NIF_TERM head, tail = w_term;
     while (enif_get_list_cell(env, tail, &head, &tail)) {
@@ -838,6 +859,12 @@ static zvec::MultiQuery decode_multi_query(ErlNifEnv *env, ERL_NIF_TERM term) {
 
   auto queries_term = map_get(env, term, "queries");
   if (!queries_term) throw std::invalid_argument("multi query missing :queries");
+  if (!enif_is_list(env, queries_term)) {
+    throw std::invalid_argument("multi query :queries must be a list");
+  }
+  if (enif_is_empty_list(env, queries_term)) {
+    throw std::invalid_argument("multi query :queries must not be empty");
+  }
   ERL_NIF_TERM head, tail = queries_term;
   while (enif_get_list_cell(env, tail, &head, &tail)) {
     zvec::SubQuery sub;
@@ -1244,7 +1271,7 @@ ResultTerm iterator_next(ErlNifEnv *env,
   }
 
   std::vector<ERL_NIF_TERM> terms;
-  terms.reserve(max);
+  terms.reserve(std::min<uint64_t>(max, 1024));
   while (terms.size() < max) {
     auto result = it->iter->next();
     if (!result.has_value()) return status_to_error(result.error());

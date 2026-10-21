@@ -44,8 +44,14 @@ defmodule Zvec.Collection do
   @doc """
   Close the collection, releasing its files and locks.
 
-  Fails with `:failed_precondition` while an iterator from `stream/2` is open.
-  The collection is also closed automatically when its reference is garbage collected.
+  After `close/1`, every call on the ref (including `destroy/1`) returns
+  `{:error, {:invalid_argument, _}}`. To delete the data, either call
+  `destroy/1` *instead of* `close/1`, or re-`open/2` the path and then call
+  `destroy/1`.
+
+  Fails with `:failed_precondition` while a stream from `stream/2` is being
+  enumerated. The collection is also closed automatically when its reference
+  is garbage collected.
   """
   @spec close(ref()) :: :ok | error()
   def close(ref), do: Native.collection_close(ref) |> normalize()
@@ -112,7 +118,7 @@ defmodule Zvec.Collection do
 
   Returns `{:ok, results}` where each result is a `Zvec.Doc` with `:pk`, `:score`, and `:fields`.
   """
-  @spec query(ref(), map()) :: {:ok, [Doc.t()]} | error()
+  @spec query(ref(), Zvec.Query.t()) :: {:ok, [Doc.t()]} | error()
   def query(ref, %{queries: _} = multi_query) do
     Native.collection_multi_query(ref, multi_query) |> to_docs()
   end
@@ -133,54 +139,70 @@ defmodule Zvec.Collection do
   """
   @spec fetch(ref(), [String.t()], keyword()) :: {:ok, [Doc.t()]} | error()
   def fetch(ref, pks, opts \\ []) when is_list(pks) do
-    options = %{
-      output_fields: Keyword.get(opts, :output_fields),
-      include_vector: Keyword.get(opts, :include_vector, true)
-    }
-
-    Native.collection_fetch(ref, pks, options) |> to_docs()
+    Native.collection_fetch(ref, pks, projection_opts(opts)) |> to_docs()
   end
 
   @doc """
-  Iterate over every document in the collection.
+  Return a lazy stream over every document in the collection.
 
-  The iterator reads an isolated snapshot taken when this function is called
-  (on a writable collection this seals the current writing segment). Returns
-  `{:ok, stream}`; the stream yields `Zvec.Doc` structs and closes the
-  underlying iterator when it finishes or is halted.
+  The stream yields `Zvec.Doc` structs. Each enumeration opens a fresh
+  iterator over an isolated snapshot taken when that enumeration starts (on a
+  writable collection this seals the current writing segment), so a stream can
+  be enumerated several times and later enumerations see newer writes.
 
-  While an iterator is open, schema changes (`create_index/3`, `drop_index/2`),
-  `optimize/1`, `close/1`, and `destroy/1` return an error. Writes, flushes and
-  queries are not affected.
+  The iterator lives only while the stream is being enumerated; it is closed
+  when enumeration finishes, is halted, or raises. During that window, schema
+  changes (`create_index/3`, `drop_index/2`), `optimize/1`, `close/1`, and
+  `destroy/1` return `{:error, {:failed_precondition, _}}`. Writes, flushes
+  and queries are not affected.
 
-  Iteration errors raise `RuntimeError`.
+  Options are validated when `stream/2` is called and raise `ArgumentError`.
+  zvec failures while opening or reading the iterator raise `Zvec.Error`.
 
   ## Options
 
     * `:output_fields` - list of field names to return (default: all fields)
     * `:include_vector` - whether to return vector fields (default: `true`)
-    * `:batch_size` - number of documents read from the NIF per call (default: `256`)
+    * `:batch_size` - positive number of documents read from the NIF per call
+      (default: `256`)
   """
-  @spec stream(ref(), keyword()) :: {:ok, Enumerable.t()} | error()
+  @spec stream(ref(), keyword()) :: Enumerable.t()
   def stream(ref, opts \\ []) do
-    batch_size = Keyword.get(opts, :batch_size, 256)
+    opts = Keyword.validate!(opts, output_fields: nil, include_vector: true, batch_size: 256)
+    batch_size = opts[:batch_size]
+    output_fields = opts[:output_fields]
 
-    options = %{
+    unless is_integer(batch_size) and batch_size > 0 do
+      raise ArgumentError,
+            "invalid :batch_size #{inspect(batch_size)}, expected a positive integer"
+    end
+
+    unless is_nil(output_fields) or
+             (is_list(output_fields) and Enum.all?(output_fields, &is_binary/1)) do
+      raise ArgumentError,
+            "invalid :output_fields #{inspect(output_fields)}, expected nil or a list of strings"
+    end
+
+    options = projection_opts(opts)
+
+    Stream.resource(
+      fn -> open_iterator!(ref, options) end,
+      &next_batch(&1, batch_size),
+      &Native.iterator_close/1
+    )
+  end
+
+  defp projection_opts(opts) do
+    %{
       output_fields: Keyword.get(opts, :output_fields),
       include_vector: Keyword.get(opts, :include_vector, true)
     }
+  end
 
+  defp open_iterator!(ref, options) do
     case Native.iterator_create(ref, options) |> normalize() do
-      {:ok, iterator} ->
-        {:ok,
-         Stream.resource(
-           fn -> iterator end,
-           &next_batch(&1, batch_size),
-           &Native.iterator_close/1
-         )}
-
-      {:error, _} = err ->
-        err
+      {:ok, iterator} -> iterator
+      {:error, {code, msg}} -> raise Zvec.Error, code: code, message: msg
     end
   end
 
@@ -188,7 +210,7 @@ defmodule Zvec.Collection do
     case Native.iterator_next(iterator, batch_size) |> normalize() do
       {:ok, []} -> {:halt, iterator}
       {:ok, docs} -> {Enum.map(docs, &Doc.from_nif/1), iterator}
-      {:error, {code, msg}} -> raise "zvec iterator error (#{code}): #{msg}"
+      {:error, {code, msg}} -> raise Zvec.Error, code: code, message: msg
     end
   end
 

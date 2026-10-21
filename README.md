@@ -122,12 +122,13 @@ See `Zvec.Schema.add_field/4` and `Zvec.Schema.add_vector/4` for every option an
 {:ok, stats}   = Zvec.Collection.stats(col)
 {:ok, schema}  = Zvec.Collection.schema(col)
 
-# Iterate a snapshot of every document
-{:ok, stream} = Zvec.Collection.stream(col, include_vector: false)
+# Lazily iterate every document; each enumeration reads a fresh snapshot
+stream = Zvec.Collection.stream(col, include_vector: false)
 Enum.each(stream, &IO.inspect/1)
 
 :ok = Zvec.Collection.create_index(col, "field", %{type: :invert})
 :ok = Zvec.Collection.drop_index(col, "field")
+# close releases files/locks; destroy deletes data (use one or the other)
 :ok = Zvec.Collection.close(col)
 :ok = Zvec.Collection.destroy(col)
 ```
@@ -198,7 +199,9 @@ end
 
 Error codes: `:not_found`, `:already_exists`, `:invalid_argument`, `:permission_denied`, `:internal_error`, `:not_supported`, `:failed_precondition`, `:resource_exhausted`, `:unavailable`
 
-Malformed arguments (unknown index or query param types, wrong value types) raise `ArgumentError`.
+Malformed arguments (unknown index or query param types, wrong value types, invalid builder or stream options) raise `ArgumentError`.
+
+`Zvec.Collection.stream/2` returns a bare `Enumerable`, so zvec failures while iterating it raise `Zvec.Error` (with `:code` and `:message`).
 
 ## License
 

@@ -62,6 +62,9 @@ defmodule Zvec.Schema do
 
     * `:type` - vector element type: `:vector_fp32` (default), `:vector_fp16`,
       `:vector_fp64`, `:vector_int8`, or `:vector_int16`. Values are raw native-endian binaries.
+      Sparse (`:sparse_vector_fp16`, `:sparse_vector_fp32`), binary
+      (`:vector_binary32`, `:vector_binary64`) and `:vector_uint8` fields are not
+      supported and raise `ArgumentError` when the collection is created.
     * `:nullable` - whether the field can be null (default: `false`)
     * `:index` - index params map with `:type` and `:metric_type`
       (`:cosine`, `:l2`, or `:ip`), e.g. `%{type: :hnsw, metric_type: :cosine}`.
@@ -79,8 +82,10 @@ defmodule Zvec.Schema do
 
       `:hnsw`, `:flat`, `:ivf`, `:vamana`, and `:diskann` also accept
       `:quantize_type` (`:fp16`, `:int8`, `:int4`, `:uniform_uint4`,
-      `:uniform_uint7`, `:uniform_uint8`) and `:enable_rotate` (random rotation
-      before INT8/INT4 quantization to reduce quantization error).
+      `:uniform_uint7`, `:uniform_uint8`, `:rabitq`) and `:enable_rotate` (random
+      rotation before INT8/INT4 quantization to reduce quantization error).
+      RaBitQ indexes set `:rabitq` quantization themselves, so it rarely needs
+      to be passed explicitly.
       `:flat_data_type` (`:vector_fp32`, `:vector_fp16`, `:vector_uint8`) sets the
       storage type of the auxiliary Flat index graph indexes use for refinement.
 

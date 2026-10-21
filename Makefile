@@ -15,12 +15,12 @@ ZVEC_SRC     = c_src/zvec_vendor
 # Stamp recording which zvec release is checked out; bumping ZVEC_VERSION
 # forces a fresh clone instead of silently reusing a stale vendor tree.
 ZVEC_STAMP   = $(ZVEC_SRC)/.zvec-$(ZVEC_VERSION)
-ZVEC_BUILD   = $(ZVEC_SRC)/build
-ZVEC_LIB     = $(ZVEC_BUILD)/lib
-ZVEC_EXT_LIB = $(ZVEC_BUILD)/external/usr/local/lib
+ZVEC_BUILD_DIR = $(ZVEC_SRC)/build
+ZVEC_LIB     = $(ZVEC_BUILD_DIR)/lib
+ZVEC_EXT_LIB = $(ZVEC_BUILD_DIR)/external/usr/local/lib
 ZVEC_INC     = $(ZVEC_SRC)/src/include
 ZVEC_SRC_INC = $(ZVEC_SRC)/src
-ZVEC_EXT_INC = $(ZVEC_BUILD)/external/usr/local/include
+ZVEC_EXT_INC = $(ZVEC_BUILD_DIR)/external/usr/local/include
 
 # Compiler
 CXX ?= c++
@@ -64,6 +64,12 @@ THIRDPARTY_LIBS = \
 	$(ZVEC_EXT_LIB)/libroaring.a \
 	$(ZVEC_EXT_LIB)/liblz4.a
 
+# RaBitQ-Library static archives. zvec only builds them when RABITQ_SUPPORTED
+# (Linux x86_64), so this is empty on macOS. Recursively expanded (`=`) so the
+# wildcard is evaluated when the link recipe runs, after the zvec build has
+# produced the archives — not when make parses this file on a fresh checkout.
+RABITQ_LIBS = $(wildcard $(ZVEC_LIB)/librabitq_fastscan.a $(ZVEC_LIB)/librabitq_core.a)
+
 # Don't let the user's shell LDFLAGS / CXXFLAGS / CFLAGS leak into the
 # CMake sub-build (cmake reads them at configure time and bakes them into
 # every link command — e.g. a shell `LDFLAGS=-L...` plus our reassignment
@@ -82,11 +88,17 @@ ifeq ($(UNAME_S),Darwin)
   NIF_LDFLAGS = -shared -flat_namespace -undefined dynamic_lookup
   FORCE_LOAD_FLAGS = $(foreach lib,$(ZVEC_FORCE_LIBS),-Wl,-force_load,$(lib))
   SYS_LIBS = -lc++ -lz -lbz2
+  GROUP_START =
+  GROUP_END =
 else
   # Linux: --whole-archive for static constructors
   NIF_LDFLAGS = -shared
   FORCE_LOAD_FLAGS = -Wl,--whole-archive $(ZVEC_FORCE_LIBS) -Wl,--no-whole-archive
   SYS_LIBS = -lstdc++ -lz -lbz2 -lpthread -ldl -lrt
+  # GNU ld resolves archives in a single pass; arrow/parquet/rocksdb/glog and
+  # RaBitQ depend on each other, so resolve them as one group.
+  GROUP_START = -Wl,--start-group
+  GROUP_END = -Wl,--end-group
 endif
 
 # CMake flags for building zvec
@@ -113,28 +125,28 @@ $(ZVEC_STAMP):
 	touch $@
 
 # Stage 1b: CMake configure (upstream applies its own antlr4 CMake-policy patch)
-$(ZVEC_BUILD)/Makefile: $(ZVEC_STAMP)
-	mkdir -p $(ZVEC_BUILD) && \
-	cd $(ZVEC_BUILD) && \
+$(ZVEC_BUILD_DIR)/Makefile: $(ZVEC_STAMP)
+	mkdir -p $(ZVEC_BUILD_DIR) && \
+	cd $(ZVEC_BUILD_DIR) && \
 	cmake .. $(CMAKE_FLAGS)
 
 # Stage 1c: CMake build (only runs once, stamp file tracks completion).
 # Only the static libraries the NIF links are built; zvec's own test suite is skipped.
-$(ZVEC_BUILD)/.built: $(ZVEC_BUILD)/Makefile
-	cmake --build $(ZVEC_BUILD) --target zvec zvec_core zvec_turbo zvec_ailego \
+$(ZVEC_BUILD_DIR)/.built: $(ZVEC_BUILD_DIR)/Makefile
+	cmake --build $(ZVEC_BUILD_DIR) --target zvec zvec_core zvec_turbo zvec_ailego \
 		-j$$(sysctl -n hw.ncpu 2>/dev/null || nproc)
 	touch $@
 
 # Stage 2: Compile and link NIF
-$(NIF_SO): c_src/zvec_nif.cpp $(ZVEC_BUILD)/.built
+$(NIF_SO): c_src/zvec_nif.cpp $(ZVEC_BUILD_DIR)/.built
 	@mkdir -p $(PRIV_DIR)
 	$(CXX) $(CXXFLAGS) $(NIF_LDFLAGS) \
 		c_src/zvec_nif.cpp \
 		$(FORCE_LOAD_FLAGS) \
-		$(THIRDPARTY_LIBS) \
+		$(GROUP_START) $(THIRDPARTY_LIBS) $(RABITQ_LIBS) $(GROUP_END) \
 		$(SYS_LIBS) \
 		-o $(NIF_SO)
 
 clean:
 	rm -f $(NIF_SO)
-	rm -rf $(ZVEC_BUILD)
+	rm -rf $(ZVEC_BUILD_DIR)
