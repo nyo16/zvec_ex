@@ -17,6 +17,7 @@ defmodule Zvec.Collection do
   alias Zvec.{Native, Schema, Doc}
 
   @type ref :: reference()
+  @type error :: {:error, {atom(), String.t()}}
 
   @doc """
   Create a new collection and open it.
@@ -27,112 +28,206 @@ defmodule Zvec.Collection do
     * `:enable_mmap` - enable memory mapping (default: `true`)
     * `:max_buffer_size` - write buffer size in bytes (default: 64MB)
   """
-  @spec create_and_open(String.t(), Schema.t(), keyword()) ::
-          {:ok, ref()} | {:error, {atom(), String.t()}}
+  @spec create_and_open(String.t(), Schema.t(), keyword()) :: {:ok, ref()} | error()
   def create_and_open(path, %Schema{} = schema, opts \\ []) do
     options = opts_to_map(opts)
     Native.collection_create_and_open(path, Schema.to_nif(schema), options) |> normalize()
   end
 
-  @doc "Open an existing collection."
-  @spec open(String.t(), keyword()) :: {:ok, ref()} | {:error, {atom(), String.t()}}
+  @doc "Open an existing collection. Accepts the same options as `create_and_open/3`."
+  @spec open(String.t(), keyword()) :: {:ok, ref()} | error()
   def open(path, opts \\ []) do
     options = opts_to_map(opts)
     Native.collection_open(path, options) |> normalize()
   end
 
+  @doc """
+  Close the collection, releasing its files and locks.
+
+  After `close/1`, every call on the ref (including `destroy/1`) returns
+  `{:error, {:invalid_argument, _}}`. To delete the data, either call
+  `destroy/1` *instead of* `close/1`, or re-`open/2` the path and then call
+  `destroy/1`.
+
+  Fails with `:failed_precondition` while a stream from `stream/2` is being
+  enumerated. The collection is also closed automatically when its reference
+  is garbage collected.
+  """
+  @spec close(ref()) :: :ok | error()
+  def close(ref), do: Native.collection_close(ref) |> normalize()
+
   @doc "Destroy the collection (deletes data on disk)."
-  @spec destroy(ref()) :: :ok | {:error, {atom(), String.t()}}
+  @spec destroy(ref()) :: :ok | error()
   def destroy(ref), do: Native.collection_destroy(ref) |> normalize()
 
   @doc "Flush pending writes to disk."
-  @spec flush(ref()) :: :ok | {:error, {atom(), String.t()}}
+  @spec flush(ref()) :: :ok | error()
   def flush(ref), do: Native.collection_flush(ref) |> normalize()
 
   @doc "Get collection statistics."
-  @spec stats(ref()) :: {:ok, map()} | {:error, {atom(), String.t()}}
+  @spec stats(ref()) :: {:ok, map()} | error()
   def stats(ref), do: Native.collection_stats(ref) |> normalize()
 
   @doc "Get the collection schema."
-  @spec schema(ref()) :: {:ok, map()} | {:error, {atom(), String.t()}}
+  @spec schema(ref()) :: {:ok, map()} | error()
   def schema(ref), do: Native.collection_schema(ref) |> normalize()
 
   @doc """
   Insert documents into the collection.
 
-  Returns `:ok` if all documents were inserted successfully.
+  Returns `:ok` if every document was inserted, otherwise the first
+  per-document error (e.g. `{:error, {:already_exists, msg}}` for a duplicate pk).
+  Documents before and after a failing one in the same batch may still be written.
   """
-  @spec insert(ref(), [Doc.t()]) :: :ok | {:error, {atom(), String.t()}}
+  @spec insert(ref(), [Doc.t()]) :: :ok | error()
   def insert(ref, docs) when is_list(docs) do
     nif_docs = Enum.map(docs, &Doc.to_nif/1)
-
-    case Native.collection_insert(ref, nif_docs) |> normalize() do
-      {:ok, _write_results} -> :ok
-      {:error, _} = err -> err
-    end
+    Native.collection_insert(ref, nif_docs) |> normalize() |> write_result()
   end
 
   @doc """
   Upsert documents (insert or update if pk exists).
 
-  Returns `:ok` if all documents were upserted successfully.
+  Returns `:ok` if every document was written, otherwise the first per-document error.
   """
-  @spec upsert(ref(), [Doc.t()]) :: :ok | {:error, {atom(), String.t()}}
+  @spec upsert(ref(), [Doc.t()]) :: :ok | error()
   def upsert(ref, docs) when is_list(docs) do
     nif_docs = Enum.map(docs, &Doc.to_nif/1)
-
-    case Native.collection_upsert(ref, nif_docs) |> normalize() do
-      {:ok, _write_results} -> :ok
-      {:error, _} = err -> err
-    end
+    Native.collection_upsert(ref, nif_docs) |> normalize() |> write_result()
   end
 
+  defp write_result({:ok, results}) do
+    Enum.find(results, :ok, &match?({:error, _}, &1))
+  end
+
+  defp write_result({:error, _} = err), do: err
+
   @doc "Delete documents by primary keys."
-  @spec delete(ref(), [String.t()]) :: :ok | {:error, {atom(), String.t()}}
+  @spec delete(ref(), [String.t()]) :: :ok | error()
   def delete(ref, pks) when is_list(pks), do: Native.collection_delete(ref, pks) |> normalize()
 
   @doc "Delete documents matching a filter expression."
-  @spec delete_by_filter(ref(), String.t()) :: :ok | {:error, {atom(), String.t()}}
+  @spec delete_by_filter(ref(), String.t()) :: :ok | error()
   def delete_by_filter(ref, filter) when is_binary(filter) do
     Native.collection_delete_by_filter(ref, filter) |> normalize()
   end
 
   @doc """
-  Execute a vector similarity query.
+  Execute a query built with `Zvec.Query.vector/3`, `Zvec.Query.fts/3`, or
+  `Zvec.Query.multi/2`.
 
   Returns `{:ok, results}` where each result is a `Zvec.Doc` with `:pk`, `:score`, and `:fields`.
   """
-  @spec query(ref(), map()) :: {:ok, [Doc.t()]} | {:error, {atom(), String.t()}}
+  @spec query(ref(), Zvec.Query.t()) :: {:ok, [Doc.t()]} | error()
+  def query(ref, %{queries: _} = multi_query) do
+    Native.collection_multi_query(ref, multi_query) |> to_docs()
+  end
+
   def query(ref, query_map) when is_map(query_map) do
-    case Native.collection_query(ref, query_map) |> normalize() do
-      {:ok, docs} -> {:ok, Enum.map(docs, &Doc.from_nif/1)}
-      {:error, _} = err -> err
+    Native.collection_query(ref, query_map) |> to_docs()
+  end
+
+  @doc """
+  Fetch documents by primary keys.
+
+  Documents are returned in the order of `pks`; missing keys are skipped.
+
+  ## Options
+
+    * `:output_fields` - list of field names to return (default: all fields)
+    * `:include_vector` - whether to return vector fields (default: `true`)
+  """
+  @spec fetch(ref(), [String.t()], keyword()) :: {:ok, [Doc.t()]} | error()
+  def fetch(ref, pks, opts \\ []) when is_list(pks) do
+    Native.collection_fetch(ref, pks, projection_opts(opts)) |> to_docs()
+  end
+
+  @doc """
+  Return a lazy stream over every document in the collection.
+
+  The stream yields `Zvec.Doc` structs. Each enumeration opens a fresh
+  iterator over an isolated snapshot taken when that enumeration starts (on a
+  writable collection this seals the current writing segment), so a stream can
+  be enumerated several times and later enumerations see newer writes.
+
+  The iterator lives only while the stream is being enumerated; it is closed
+  when enumeration finishes, is halted, or raises. During that window, schema
+  changes (`create_index/3`, `drop_index/2`), `optimize/1`, `close/1`, and
+  `destroy/1` return `{:error, {:failed_precondition, _}}`. Writes, flushes
+  and queries are not affected.
+
+  Options are validated when `stream/2` is called and raise `ArgumentError`.
+  zvec failures while opening or reading the iterator raise `Zvec.Error`.
+
+  ## Options
+
+    * `:output_fields` - list of field names to return (default: all fields)
+    * `:include_vector` - whether to return vector fields (default: `true`)
+    * `:batch_size` - positive number of documents read from the NIF per call
+      (default: `256`)
+  """
+  @spec stream(ref(), keyword()) :: Enumerable.t()
+  def stream(ref, opts \\ []) do
+    opts = Keyword.validate!(opts, output_fields: nil, include_vector: true, batch_size: 256)
+    batch_size = opts[:batch_size]
+    output_fields = opts[:output_fields]
+
+    unless is_integer(batch_size) and batch_size > 0 do
+      raise ArgumentError,
+            "invalid :batch_size #{inspect(batch_size)}, expected a positive integer"
+    end
+
+    unless is_nil(output_fields) or
+             (is_list(output_fields) and Enum.all?(output_fields, &is_binary/1)) do
+      raise ArgumentError,
+            "invalid :output_fields #{inspect(output_fields)}, expected nil or a list of strings"
+    end
+
+    options = projection_opts(opts)
+
+    Stream.resource(
+      fn -> open_iterator!(ref, options) end,
+      &next_batch(&1, batch_size),
+      &Native.iterator_close/1
+    )
+  end
+
+  defp projection_opts(opts) do
+    %{
+      output_fields: Keyword.get(opts, :output_fields),
+      include_vector: Keyword.get(opts, :include_vector, true)
+    }
+  end
+
+  defp open_iterator!(ref, options) do
+    case Native.iterator_create(ref, options) |> normalize() do
+      {:ok, iterator} -> iterator
+      {:error, {code, msg}} -> raise Zvec.Error, code: code, message: msg
     end
   end
 
-  @doc "Fetch documents by primary keys."
-  @spec fetch(ref(), [String.t()]) :: {:ok, [Doc.t()]} | {:error, {atom(), String.t()}}
-  def fetch(ref, pks) when is_list(pks) do
-    case Native.collection_fetch(ref, pks) |> normalize() do
-      {:ok, docs} -> {:ok, Enum.map(docs, &Doc.from_nif/1)}
-      {:error, _} = err -> err
+  defp next_batch(iterator, batch_size) do
+    case Native.iterator_next(iterator, batch_size) |> normalize() do
+      {:ok, []} -> {:halt, iterator}
+      {:ok, docs} -> {Enum.map(docs, &Doc.from_nif/1), iterator}
+      {:error, {code, msg}} -> raise Zvec.Error, code: code, message: msg
     end
   end
 
   @doc "Create an index on a column."
-  @spec create_index(ref(), String.t(), map()) :: :ok | {:error, {atom(), String.t()}}
+  @spec create_index(ref(), String.t(), map()) :: :ok | error()
   def create_index(ref, column, params) when is_binary(column) and is_map(params) do
     Native.collection_create_index(ref, column, params) |> normalize()
   end
 
   @doc "Drop an index from a column."
-  @spec drop_index(ref(), String.t()) :: :ok | {:error, {atom(), String.t()}}
+  @spec drop_index(ref(), String.t()) :: :ok | error()
   def drop_index(ref, column) when is_binary(column) do
     Native.collection_drop_index(ref, column) |> normalize()
   end
 
   @doc "Optimize the collection (build ANN indexes, compact segments)."
-  @spec optimize(ref()) :: :ok | {:error, {atom(), String.t()}}
+  @spec optimize(ref()) :: :ok | error()
   def optimize(ref), do: Native.collection_optimize(ref) |> normalize()
 
   defp opts_to_map(opts) do
@@ -141,6 +236,13 @@ defmodule Zvec.Collection do
       enable_mmap: Keyword.get(opts, :enable_mmap, true),
       max_buffer_size: Keyword.get(opts, :max_buffer_size, 64 * 1024 * 1024)
     }
+  end
+
+  defp to_docs(result) do
+    case normalize(result) do
+      {:ok, docs} -> {:ok, Enum.map(docs, &Doc.from_nif/1)}
+      {:error, _} = err -> err
+    end
   end
 
   # Fine's Error<Atom, string> produces {:error, atom, string}

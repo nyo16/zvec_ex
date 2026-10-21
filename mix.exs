@@ -36,7 +36,7 @@ end
 defmodule Zvec.MixProject do
   use Mix.Project
 
-  @version "0.4.0"
+  @version "0.8.0"
   @source_url "https://github.com/nyo16/zvec_ex"
 
   def project do
@@ -54,6 +54,9 @@ defmodule Zvec.MixProject do
       make_precompiler_filename: "libzvec_nif",
       make_precompiler_priv_paths: ["libzvec_nif.so"],
       make_precompiler_nif_versions: [versions: ["2.17", "2.18"]],
+      # Set ZVEC_BUILD=true to compile the NIF from source instead of
+      # downloading (or reusing) a precompiled artefact.
+      make_force_build: System.get_env("ZVEC_BUILD") in ["1", "true"],
       deps: deps(),
       package: package(),
       description: "Elixir NIF bindings for zvec, an in-process vector database from Alibaba.",

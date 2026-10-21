@@ -1,34 +1,69 @@
 defmodule Zvec.Query do
   @moduledoc """
-  Query builder for zvec vector searches.
+  Query builders for zvec searches.
+
+  Build a query with `vector/3` (dense vector similarity), `fts/3` (full-text
+  search), or `multi/2` (hybrid search over several sub-queries with
+  reranking), then run it with `Zvec.Collection.query/2`.
 
   ## Example
 
       query = Zvec.Query.vector("embedding", [0.1, 0.2, 0.3, 0.4], topk: 10)
       query = Zvec.Query.vector("embedding", vec_binary, topk: 10, filter: "category = 'ai'")
-  """
+      query = Zvec.Query.fts("content", "vector database", topk: 10)
 
-  @doc """
-  Build a vector query.
+      query =
+        Zvec.Query.multi(
+          [
+            Zvec.Query.vector("embedding", vec, topk: 50),
+            Zvec.Query.fts("content", "vector database", topk: 50)
+          ],
+          topk: 10,
+          rerank: {:rrf, 60}
+        )
 
-  The `vector` argument can be:
-  - A list of floats (will be converted to a raw float32 binary)
-  - A raw binary (used as-is)
+  ## Common options
 
-  ## Options
+  `vector/3`, `fts/3` and `multi/2` accept:
 
     * `:topk` - number of results to return (default: 10)
     * `:filter` - SQL-like filter expression
     * `:include_vector` - whether to include vectors in results (default: false)
-    * `:output_fields` - list of field names to include in results
-    * `:query_params` - search params map, e.g. `%{type: :hnsw, ef: 200}`
-      Supported types: `:hnsw`, `:flat`, `:ivf`, `:hnsw_rabitq`, `:vamana`
-      `:hnsw` / `:hnsw_rabitq` keys: `:ef`, `:radius`, `:is_linear`, `:is_using_refiner`
-      `:vamana` keys: `:ef_search`, `:radius`, `:is_linear`, `:is_using_refiner`
-      `:ivf` keys: `:nprobe`, `:scale_factor`, `:is_using_refiner`
-      `:flat` keys: `:scale_factor`, `:is_using_refiner`
+    * `:output_fields` - list of field names to include in results (default: all)
   """
-  @spec vector(String.t(), [float()] | binary(), keyword()) :: map()
+
+  @typedoc "A query built by `vector/3`, `fts/3` or `multi/2`."
+  @type t :: map()
+
+  @doc """
+  Build a dense vector similarity query.
+
+  The `vector` argument can be:
+  - A list of floats (will be converted to a raw float32 binary)
+  - A raw binary (used as-is, e.g. `Nx.to_binary/1` output)
+
+  ## Options
+
+  The common options above, plus:
+
+    * `:query_params` - search params map, e.g. `%{type: :hnsw, ef: 200}`. The
+      `:type` must match the field's index type. Unset keys keep zvec's defaults;
+      keys other than those listed below are ignored.
+
+      | `:type` | Keys |
+      |---------|------|
+      | `:hnsw` | `:ef` (default 200), `:prefetch_offset`, `:prefetch_lines` |
+      | `:hnsw_rabitq` | `:ef` (default 200) |
+      | `:vamana` | `:ef_search` (default 200), `:prefetch_offset`, `:prefetch_lines` |
+      | `:ivf` | `:nprobe` (default 10) |
+      | `:ivf_rabitq` | `:nprobe` (default 10) |
+      | `:diskann` | `:list_size` (default 300) |
+      | `:flat` | — |
+
+      Every type also accepts `:radius`, `:is_linear`, `:is_using_refiner`, and
+      `:scale_factor` (coarse candidate multiplier when refining).
+  """
+  @spec vector(String.t(), [float()] | binary(), keyword()) :: t()
   def vector(field_name, vector, opts \\ []) do
     query_vector =
       case vector do
@@ -36,14 +71,122 @@ defmodule Zvec.Query do
         v when is_binary(v) -> v
       end
 
-    %{
-      field_name: field_name,
+    opts
+    |> base(field_name)
+    |> Map.merge(%{
       query_vector: query_vector,
+      query_params: Keyword.get(opts, :query_params)
+    })
+  end
+
+  @doc """
+  Build a full-text search query against a field with an `:fts` index.
+
+  Results are scored with BM25.
+
+  ## Options
+
+  The common options above, plus:
+
+    * `:syntax` - how `text` is interpreted:
+      * `:match` (default) - natural language; `text` is tokenized and the terms
+        are combined with `:default_operator`
+      * `:query` - query expression syntax, e.g. `~s(+vector -slow "exact phrase")`
+    * `:default_operator` - `:or` (default) or `:and`, used to combine bare terms
+  """
+  @spec fts(String.t(), String.t(), keyword()) :: t()
+  def fts(field_name, text, opts \\ []) when is_binary(field_name) and is_binary(text) do
+    fts = syntax!(Keyword.get(opts, :syntax, :match), text)
+    query_params = default_operator!(Keyword.get(opts, :default_operator))
+
+    opts
+    |> base(field_name)
+    |> Map.merge(%{fts: fts, query_params: query_params})
+  end
+
+  defp syntax!(:match, text), do: %{match_string: text}
+  defp syntax!(:query, text), do: %{query_string: text}
+
+  defp syntax!(other, _text) do
+    raise ArgumentError, "invalid :syntax #{inspect(other)}, expected :match or :query"
+  end
+
+  defp default_operator!(nil), do: nil
+
+  defp default_operator!(op) when op in [:or, :and] do
+    %{type: :fts, default_operator: op |> to_string() |> String.upcase()}
+  end
+
+  defp default_operator!(other) do
+    raise ArgumentError, "invalid :default_operator #{inspect(other)}, expected :or or :and"
+  end
+
+  @doc """
+  Build a hybrid query that runs several sub-queries and fuses their results.
+
+  Each sub-query is built with `vector/3` or `fts/3`; its `:topk` (default 10)
+  caps how many candidates it contributes to fusion, and its `:query_params`
+  are honored. Sub-query `:filter`, `:include_vector` and `:output_fields` are
+  ignored — set them on the multi query instead. Multi queries cannot be nested.
+
+  ## Options
+
+  The common options above, plus:
+
+    * `:rerank` - fusion strategy:
+      * `:rrf` or `{:rrf, rank_constant}` (default `{:rrf, 60}`) - Reciprocal
+        Rank Fusion, score `1 / (rank_constant + rank + 1)`
+      * `{:weighted, weights}` - per-sub-query weights (list of numbers, same
+        order as `queries`) applied to metric-normalized scores
+
+  Invalid sub-queries or `:rerank` values raise `ArgumentError`.
+  """
+  @spec multi([t()], keyword()) :: t()
+  def multi(queries, opts \\ []) when is_list(queries) and queries != [] do
+    Enum.each(queries, fn
+      %{queries: _} -> raise ArgumentError, "multi queries cannot be nested"
+      q when is_map(q) -> :ok
+      other -> raise ArgumentError, "invalid sub-query #{inspect(other)}, expected a query map"
+    end)
+
+    %{
+      queries: queries,
       topk: Keyword.get(opts, :topk, 10),
       filter: Keyword.get(opts, :filter),
       include_vector: Keyword.get(opts, :include_vector, false),
       output_fields: Keyword.get(opts, :output_fields),
-      query_params: Keyword.get(opts, :query_params)
+      rerank: rerank!(Keyword.get(opts, :rerank, :rrf), queries)
+    }
+  end
+
+  defp rerank!(:rrf, _queries), do: %{type: :rrf, rank_constant: 60}
+
+  defp rerank!({:rrf, k}, _queries) when is_integer(k) and k >= 0 do
+    %{type: :rrf, rank_constant: k}
+  end
+
+  defp rerank!({:weighted, weights} = rerank, queries) when is_list(weights) do
+    unless Enum.all?(weights, &is_number/1) and length(weights) == length(queries) do
+      raise ArgumentError,
+            "invalid :rerank #{inspect(rerank)}, expected one number per sub-query " <>
+              "(#{length(queries)})"
+    end
+
+    %{type: :weighted, weights: weights}
+  end
+
+  defp rerank!(other, _queries) do
+    raise ArgumentError,
+          "invalid :rerank #{inspect(other)}, expected :rrf, {:rrf, k} or {:weighted, weights}"
+  end
+
+  defp base(opts, field_name) do
+    %{
+      field_name: field_name,
+      topk: Keyword.get(opts, :topk, 10),
+      filter: Keyword.get(opts, :filter),
+      include_vector: Keyword.get(opts, :include_vector, false),
+      output_fields: Keyword.get(opts, :output_fields)
     }
   end
 
